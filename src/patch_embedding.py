@@ -14,8 +14,8 @@ class PatchEmbedding(nn.Module):
             self.embed_dim = embed_dim
 
             self.grid_size = image_size // patch_size
-            assert image_size % patch_size == 0, "Image size must be divisible by patch size"
-
+            if image_size % patch_size != 0:
+                raise ValueError(f"Image size ({image_size}) must be divisible by patch size ({patch_size})")
             self.num_patches = self.grid_size ** 2
 
             #(B,C,H,W) -> (B,D,H/P,W/P)
