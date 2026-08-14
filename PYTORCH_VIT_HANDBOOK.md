@@ -29,13 +29,18 @@ vit-pytorch-from-scratch/
 ├── src/
 │   ├── patch_embedding.py      # 图片转 Patch token
 │   ├── attention.py            # 手写多头自注意力
-│   ├── transformer.py          # MLP、EncoderBlock、Encoder
-│   └── vit.py                  # CLS、位置编码、完整 ViT、分类头
+│   ├── mlp.py                  # Transformer 中的 MLP
+│   ├── encoder.py              # EncoderBlock 与 Encoder
+│   ├── transformer.py          # Patch、CLS、位置编码与 Encoder
+│   ├── vit.py                  # 分类头（也可并入 transformer.py）
+│   └── data.py                 # CIFAR-10 Dataset 与 DataLoader
 ├── tests/
 │   ├── test_patch_embedding.py
 │   ├── test_attention.py
+│   ├── test_mlp.py
+│   ├── test_encoder.py
 │   ├── test_transformer.py
-│   └── test_vit.py
+│   └── test_data.py
 ├── train.py                    # CIFAR-10 训练循环
 ├── evaluate.py                 # 验证与 checkpoint 推理
 ├── requirements.txt
@@ -1123,14 +1128,125 @@ logits = self.head(x)
 
 ## 12. CIFAR-10 数据管道
 
-常用库：
+### 12.1 这一阶段要完成什么
+
+模型训练前的数据链路是：
+
+```text
+CIFAR-10 磁盘文件
+→ Dataset 按索引读取一张图片和一个标签
+→ transform 做增强、转 Tensor、归一化
+→ DataLoader 把多个样本组成 batch
+→ 得到 images: (B,3,32,32) 和 labels: (B,)
+→ 移动到与模型相同的 device
+→ model(images) 得到 logits: (B,10)
+```
+
+这一阶段的验收目标：
+
+1. 能自动下载并读取 CIFAR-10；
+2. 训练、验证、测试三个集合职责明确；
+3. 训练集使用随机增强，验证和测试集不使用随机增强；
+4. DataLoader 能输出正确形状和数据类型；
+5. 一个 batch 能送入完整模型并得到 `(B,10)` logits；
+6. 数据目录不会被提交到 Git。
+
+所需依赖可记录在 `requirements.txt`：
+
+```text
+torch
+torchvision
+pytest
+```
+
+安装：
+
+```powershell
+python -m pip install -r requirements.txt
+```
+
+常用导入：
 
 ```python
+from pathlib import Path
+
+import torch
 from torch.utils.data import DataLoader, Subset
 from torchvision import datasets, transforms
 ```
 
-基础预处理示例：
+### 12.2 Dataset、transform 和 DataLoader 的分工
+
+三者不要混为一谈：
+
+| 对象 | 作用 | 本项目中的例子 |
+|---|---|---|
+| `Dataset` | 定义“第 i 个样本怎样读取” | `datasets.CIFAR10` |
+| `transform` | 处理一张刚读取的图片 | 裁剪、翻转、转 Tensor、归一化 |
+| `DataLoader` | 取样、打乱、组成 batch、并行加载 | 输出 `(images, labels)` |
+
+直接访问 Dataset：
+
+```python
+image, label = dataset[0]
+```
+
+在使用 `ToTensor()` 后，单个样本通常为：
+
+```text
+image.shape = (3,32,32)
+image.dtype = torch.float32
+label        = Python int，范围 0～9
+```
+
+DataLoader 会使用默认的整理逻辑把多个样本堆叠起来：
+
+```text
+B 个 (3,32,32)       → images: (B,3,32,32)
+B 个整数类别编号      → labels: (B,)，dtype=torch.int64
+```
+
+### 12.3 CIFAR-10 的基本信息
+
+```text
+训练部分：50,000 张图片
+测试部分：10,000 张图片
+图片大小：32×32
+通道数：3（RGB）
+类别数：10
+```
+
+类别编号和名称：
+
+```python
+CIFAR10_CLASSES = (
+    "airplane",
+    "automobile",
+    "bird",
+    "cat",
+    "deer",
+    "dog",
+    "frog",
+    "horse",
+    "ship",
+    "truck",
+)
+```
+
+训练过程中不要反复查看测试集来选择模型。更规范的划分是：
+
+```text
+原训练部分 50,000
+├── train 45,000：更新参数
+└── val    5,000：选择超参数、观察过拟合
+
+原测试部分 10,000
+└── test  10,000：模型确定后做最终评估
+```
+
+### 12.4 图像变换与形状变化
+
+第一版推荐使用经典、容易理解的增强：
 
 ```python
 train_transform = transforms.Compose([
@@ -1143,7 +1259,7 @@ train_transform = transforms.Compose([
     ),
 ])
 
-test_transform = transforms.Compose([
+eval_transform = transforms.Compose([
     transforms.ToTensor(),
     transforms.Normalize(
         mean=(0.4914, 0.4822, 0.4465),
@@ -1152,60 +1268,384 @@ test_transform = transforms.Compose([
 ])
 ```
 
-创建数据集：
-
-```python
-train_set = datasets.CIFAR10(
-    root="data",
-    train=True,
-    download=True,
-    transform=train_transform,
-)
-
-test_set = datasets.CIFAR10(
-    root="data",
-    train=False,
-    download=True,
-    transform=test_transform,
-)
-```
-
-创建 DataLoader：
-
-```python
-train_loader = DataLoader(
-    train_set,
-    batch_size=128,
-    shuffle=True,
-    num_workers=4,
-    pin_memory=True,
-    drop_last=True,
-)
-
-test_loader = DataLoader(
-    test_set,
-    batch_size=256,
-    shuffle=False,
-    num_workers=4,
-    pin_memory=True,
-    drop_last=False,
-)
-```
-
-Windows 初次调试时若 DataLoader 多进程报错，先使用：
-
-```python
-num_workers=0
-```
-
-训练标签是整数：
+执行顺序就是 `Compose` 中从上到下的顺序：
 
 ```text
-labels.shape = (B,)
-labels.dtype = torch.int64
+训练图片 PIL Image，32×32×3
+→ RandomCrop：先 padding，再随机裁回 32×32
+→ RandomHorizontalFlip：按概率水平翻转
+→ ToTensor：(H,W,C)、uint8、[0,255]
+             变为 (C,H,W)、float32、[0,1]
+→ Normalize：逐通道执行 (x-mean)/std
+→ (3,32,32)、float32
 ```
 
-PyTorch 的 `F.cross_entropy(logits, labels)` 直接接受整数类别，不需要 one-hot。
+`Normalize` 不是把数值严格变成 `[-1,1]`，而是使每个通道大致以 0 为中心。公式是：
+
+```python
+normalized[channel] = (
+    image[channel] - mean[channel]
+) / std[channel]
+```
+
+验证集和测试集不能使用 `RandomCrop`、`RandomHorizontalFlip` 等随机增强，否则同一张图片每次验证可能不同，指标会发生无意义的波动。
+
+### 12.5 创建可复现的 train、val、test 划分
+
+一个容易忽略的问题是：`Subset` 只保存原 Dataset 和索引。如果 train、val 都引用同一个带随机增强的 Dataset，那么 val 也会被随机增强。
+
+因此，为同一份 CIFAR-10 训练数据创建两个 Dataset 对象：
+
+- `train_full` 使用 `train_transform`；
+- `val_full` 使用 `eval_transform`；
+- 两者使用互不重叠的索引。
+
+完整函数可以放在 `src/data.py`：
+
+```python
+from pathlib import Path
+
+import torch
+from torch.utils.data import DataLoader, Subset
+from torchvision import datasets, transforms
+
+
+CIFAR10_MEAN = (0.4914, 0.4822, 0.4465)
+CIFAR10_STD = (0.2470, 0.2435, 0.2616)
+
+
+def make_transforms():
+    train_transform = transforms.Compose([
+        transforms.RandomCrop(32, padding=4),
+        transforms.RandomHorizontalFlip(),
+        transforms.ToTensor(),
+        transforms.Normalize(CIFAR10_MEAN, CIFAR10_STD),
+    ])
+
+    eval_transform = transforms.Compose([
+        transforms.ToTensor(),
+        transforms.Normalize(CIFAR10_MEAN, CIFAR10_STD),
+    ])
+
+    return train_transform, eval_transform
+
+
+def build_cifar10_datasets(
+    data_dir: str | Path = "data",
+    val_ratio: float = 0.1,
+    seed: int = 42,
+):
+    if not 0.0 < val_ratio < 1.0:
+        raise ValueError("val_ratio must be between 0 and 1")
+
+    train_transform, eval_transform = make_transforms()
+
+    # 两个对象读取的是同一份磁盘数据，但使用不同 transform。
+    train_full = datasets.CIFAR10(
+        root=data_dir,
+        train=True,
+        download=True,
+        transform=train_transform,
+    )
+
+    val_full = datasets.CIFAR10(
+        root=data_dir,
+        train=True,
+        download=False,
+        transform=eval_transform,
+    )
+
+    test_dataset = datasets.CIFAR10(
+        root=data_dir,
+        train=False,
+        download=True,
+        transform=eval_transform,
+    )
+
+    num_examples = len(train_full)
+    num_val = int(num_examples * val_ratio)
+
+    # 使用局部 Generator 固定索引划分，不依赖全局随机状态。
+    generator = torch.Generator().manual_seed(seed)
+    indices = torch.randperm(
+        num_examples,
+        generator=generator,
+    ).tolist()
+
+    val_indices = indices[:num_val]
+    train_indices = indices[num_val:]
+
+    train_dataset = Subset(train_full, train_indices)
+    val_dataset = Subset(val_full, val_indices)
+
+    return train_dataset, val_dataset, test_dataset
+```
+
+这里的 `seed` 保证每次运行得到相同的 train/val 索引。它不会让训练增强永远相同；随机裁剪和随机翻转在不同 epoch 仍可产生不同结果。
+
+检查划分：
+
+```python
+train_set, val_set, test_set = build_cifar10_datasets()
+
+assert len(train_set) == 45_000
+assert len(val_set) == 5_000
+assert len(test_set) == 10_000
+
+assert set(train_set.indices).isdisjoint(val_set.indices)
+```
+
+如果现阶段只想先跑通代码，也可以暂时直接使用完整训练集和测试集；但正式比较实验时建议保留验证集。
+
+### 12.6 创建 DataLoader
+
+继续在 `src/data.py` 中加入：
+
+```python
+def build_cifar10_loaders(
+    data_dir: str | Path = "data",
+    batch_size: int = 128,
+    eval_batch_size: int = 256,
+    num_workers: int = 0,
+    val_ratio: float = 0.1,
+    seed: int = 42,
+):
+    train_set, val_set, test_set = build_cifar10_datasets(
+        data_dir=data_dir,
+        val_ratio=val_ratio,
+        seed=seed,
+    )
+
+    pin_memory = torch.cuda.is_available()
+    persistent_workers = num_workers > 0
+
+    train_loader = DataLoader(
+        train_set,
+        batch_size=batch_size,
+        shuffle=True,
+        num_workers=num_workers,
+        pin_memory=pin_memory,
+        drop_last=False,
+        persistent_workers=persistent_workers,
+    )
+
+    val_loader = DataLoader(
+        val_set,
+        batch_size=eval_batch_size,
+        shuffle=False,
+        num_workers=num_workers,
+        pin_memory=pin_memory,
+        drop_last=False,
+        persistent_workers=persistent_workers,
+    )
+
+    test_loader = DataLoader(
+        test_set,
+        batch_size=eval_batch_size,
+        shuffle=False,
+        num_workers=num_workers,
+        pin_memory=pin_memory,
+        drop_last=False,
+        persistent_workers=persistent_workers,
+    )
+
+    return train_loader, val_loader, test_loader
+```
+
+参数含义：
+
+| 参数 | 含义 | 第一版建议 |
+|---|---|---|
+| `batch_size` | 每个训练 batch 的样本数 | 显存允许时可从 64 或 128 开始 |
+| `shuffle` | 每个 epoch 重新打乱索引 | train 为 `True`，val/test 为 `False` |
+| `num_workers` | 使用多少个子进程读取数据 | Windows 初次调试用 `0` |
+| `pin_memory` | 使用页锁定 CPU 内存，帮助传往 CUDA | 有 CUDA 时开启 |
+| `drop_last` | 丢掉最后一个不足 batch 的小批次 | 第一版设为 `False`，保留所有样本 |
+| `persistent_workers` | epoch 间保留 worker | 仅在 `num_workers>0` 时开启 |
+
+训练集需要 `shuffle=True`，因为模型不应长期按照固定样本顺序更新。val/test 必须 `shuffle=False`，便于结果复查，而且它们不更新参数。
+
+`drop_last=False` 时，最后一个 batch 可能比其他 batch 小。例如 45,000 个样本、batch size 为 128：
+
+```text
+前面的 batch：images.shape = (128,3,32,32)
+最后的 batch：images.shape 可能小于 (128,3,32,32)
+```
+
+模型代码必须从 `x.shape[0]` 动态取得 `B`，不能把 batch size 写死。
+
+### 12.7 第一次运行和 batch 检查
+
+在项目根目录运行一个临时检查，或写入 `tests/test_data.py`：
+
+```python
+import torch
+
+from src.data import build_cifar10_loaders
+
+
+train_loader, val_loader, test_loader = build_cifar10_loaders(
+    data_dir="data",
+    batch_size=128,
+    eval_batch_size=256,
+    num_workers=0,
+    seed=42,
+)
+
+images, labels = next(iter(train_loader))
+
+print(images.shape)
+print(images.dtype)
+print(labels.shape)
+print(labels.dtype)
+print(labels.min().item(), labels.max().item())
+
+assert images.shape == (128, 3, 32, 32)
+assert images.dtype == torch.float32
+assert labels.shape == (128,)
+assert labels.dtype == torch.int64
+assert 0 <= labels.min().item()
+assert labels.max().item() <= 9
+assert torch.isfinite(images).all()
+```
+
+第一次运行时 `download=True` 会从网络下载数据。已经存在完整数据后，torchvision 会复用它，而不是每次重新下载。
+
+注意：这类测试依赖网络或本地数据，不适合作为每次都必须运行的纯单元测试。可以把下载单独执行一次，之后再运行数据形状测试。
+
+### 12.8 把一个 batch 送进模型
+
+数据形状正确后，做一次端到端检查：
+
+```python
+device = torch.device(
+    "cuda" if torch.cuda.is_available() else "cpu"
+)
+
+model = model.to(device)
+model.eval()
+
+images, labels = next(iter(train_loader))
+images = images.to(device, non_blocking=True)
+labels = labels.to(device, non_blocking=True)
+
+with torch.no_grad():
+    logits = model(images)
+
+assert logits.shape == (images.shape[0], 10)
+assert labels.shape == (images.shape[0],)
+assert torch.isfinite(logits).all()
+```
+
+如果当前 `VisionTransformer` 返回的是全部 token：
+
+```text
+(B,65,D)
+```
+
+那么它还不能直接送进 `CrossEntropyLoss`。必须先完成分类路径：
+
+```python
+tokens = backbone(images)       # (B,65,D)
+cls_features = tokens[:, 0]     # (B,D)
+logits = head(cls_features)     # (B,10)
+```
+
+训练代码最终应该接收 `(B,10)`，标签保持 `(B,)`，不要对标签做 one-hot：
+
+```python
+loss = torch.nn.functional.cross_entropy(logits, labels)
+```
+
+### 12.9 Windows 上使用 DataLoader
+
+第一次调试使用：
+
+```python
+num_workers = 0
+```
+
+确认无误后可以尝试 `2` 或 `4`，并比较实际加载速度。`num_workers` 并不是越大越快。
+
+当 `num_workers > 0` 时，创建和遍历 DataLoader 的入口应放在：
+
+```python
+def main():
+    train_loader, val_loader, test_loader = build_cifar10_loaders(
+        num_workers=4,
+    )
+
+    for images, labels in train_loader:
+        pass
+
+
+if __name__ == "__main__":
+    main()
+```
+
+否则 Windows 的多进程启动方式可能反复执行主文件或报启动进程错误。
+
+### 12.10 常见错误
+
+#### 输入形状变成 `(B,32,32,3)`
+
+PyTorch 卷积需要 NCHW：
+
+```text
+正确：(B,3,32,32)
+错误：(B,32,32,3)
+```
+
+使用 torchvision 的 `ToTensor()` 会把 HWC 转为 CHW。
+
+#### 图像仍是 `uint8`
+
+检查是否遗漏：
+
+```python
+transforms.ToTensor()
+```
+
+#### 在 `ToTensor` 前调用 `Normalize`
+
+经典 transforms 管道中 `Normalize` 接收 Tensor，因此应放在 `ToTensor()` 后面。
+
+#### 对验证集也使用随机增强
+
+这会让验证输入不断变化。train 与 val 应创建两个 Dataset 对象并分别使用不同 transform。
+
+#### 使用测试集反复挑选超参数
+
+这相当于把测试集信息泄漏进模型选择。训练期间看 val，最终确定模型后再看 test。
+
+#### 把整个数据集提前移动到 GPU
+
+Dataset 和 DataLoader 通常保留在 CPU；训练循环中只把当前 batch 移到 GPU。
+
+#### 将数据集提交到 Git
+
+项目 `.gitignore` 应包含：
+
+```text
+data/
+datasets/
+```
+
+当前项目已经忽略这两个目录。
+
+### 12.11 数据管道完成标准
+
+完成后逐项确认：
+
+- `len(train_set) == 45000`、`len(val_set) == 5000`、`len(test_set) == 10000`；
+- train 和 val 索引没有交集；
+- train 使用随机增强，val/test 使用确定性预处理；
+- `images` 为 `(B,3,32,32)`、`float32`；
+- `labels` 为 `(B,)`、`int64`，取值范围 0～9；
+- 一个 batch 不包含 `NaN` 或无穷值；
+- 完整模型对一个 batch 输出 `(B,10)`；
+- Windows 下 `num_workers=0` 能稳定运行；
+- `data/` 未进入 Git 暂存区。
 
 ## 13. 设备管理
 
@@ -1871,17 +2311,30 @@ CLS token 分类
 - `torch.nn`：<https://docs.pytorch.org/docs/stable/nn.html>
 - `torch.optim`：<https://docs.pytorch.org/docs/stable/optim.html>
 - DataLoader：<https://docs.pytorch.org/docs/stable/data.html>
+- torchvision CIFAR-10：<https://docs.pytorch.org/vision/stable/generated/torchvision.datasets.CIFAR10.html>
+- torchvision transforms：<https://docs.pytorch.org/vision/stable/transforms.html>
 - torchvision 数据集与变换：<https://docs.pytorch.org/vision/stable/index.html>
 - 保存和加载模型：<https://docs.pytorch.org/tutorials/beginner/saving_loading_models.html>
 - PyTest：<https://docs.pytest.org/>
 
 ## 27. 当前下一步
 
-从 `src/patch_embedding.py` 开始：
+模型主体已经基本完成，当前进入 CIFAR-10 数据管道阶段：
 
-1. 明确构造参数和输入输出形状；
-2. 使用 `nn.Conv2d` 实现不重叠 Patch 投影；
-3. 使用 `flatten(2)` 和 `transpose(1, 2)` 生成 `(B,N,D)`；
-4. 编写 `tests/test_patch_embedding.py`；
-5. 验证正确输入和非法输入；
-6. 测试通过后再进入手写多头注意力。
+1. 在 `requirements.txt` 中记录 `torch`、`torchvision`、`pytest`；
+2. 新建 `src/data.py`，实现 `make_transforms()`；
+3. 实现可复现的 train/val/test Dataset 划分；
+4. 实现 `build_cifar10_loaders()`；
+5. 用 `num_workers=0` 下载并检查第一个 batch；
+6. 确认 `images` 为 `(B,3,32,32)`，`labels` 为 `(B,)`；
+7. 将一个 batch 送入完整分类模型，确认 logits 为 `(B,10)`；
+8. 数据管道通过后，开始实现单步训练与少量样本过拟合测试。
+
+推荐按下面的提交边界保存版本：
+
+```text
+提交 1：完成模型结构与形状测试
+提交 2：完成 CIFAR-10 数据管道与 batch 检查
+提交 3：完成单步反向传播与少量样本过拟合
+提交 4：完成正式训练、验证、日志和 checkpoint
+```
