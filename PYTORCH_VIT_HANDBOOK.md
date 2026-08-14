@@ -804,6 +804,284 @@ Block 的输出形状相同，是因为残差连接要求相加的两个张量�
 → (B,N,D)
 ```
 
+### 10.2 Transformer：加入 CLS、位置编码并调用 Encoder
+
+按本项目当前的文件划分，`transformer.py` 可以负责：
+
+```text
+图片
+→ Patch Embedding
+→ 添加 CLS token
+→ 添加位置编码
+→ Embedding Dropout
+→ Encoder
+→ 返回全部编码 token
+```
+
+先约定符号：
+
+```text
+B：batch size
+C：输入通道数
+H、W：图片高度和宽度
+P：patch size
+N：(H/P) × (W/P)，图片产生的 patch token 数量
+D：embed_dim，每个 token 的特征维度
+L：token 序列长度；加入 CLS 后 L=N+1
+```
+
+与当前 `PatchEmbedding` 和 `Encoder` 接口对应的示例：
+
+```python
+import torch
+from torch import nn
+
+from src.patch_embedding import PatchEmbedding
+from src.encoder import Encoder
+
+
+class VisionTransformer(nn.Module):
+    def __init__(
+        self,
+        image_size: int,
+        patch_size: int,
+        in_channels: int,
+        num_layers: int,
+        embed_dim: int,
+        num_heads: int,
+        mlp_dim: int,
+        attention_dropout: float = 0.0,
+        projection_dropout: float = 0.0,
+        mlp_dropout: float = 0.0,
+        embedding_dropout: float = 0.0,
+    ):
+        super().__init__()
+
+        self.patch_embedding = PatchEmbedding(
+            image_size=image_size,
+            patch_size=patch_size,
+            in_channels=in_channels,
+            embed_dim=embed_dim,
+        )
+
+        self.cls_token = nn.Parameter(
+            torch.zeros(1, 1, embed_dim)
+        )
+
+        self.pos_embedding = nn.Parameter(
+            torch.zeros(
+                1,
+                self.patch_embedding.num_patches + 1,
+                embed_dim,
+            )
+        )
+
+        self.embedding_dropout = nn.Dropout(embedding_dropout)
+
+        self.encoder = Encoder(
+            num_layers=num_layers,
+            embed_dim=embed_dim,
+            num_heads=num_heads,
+            mlp_dim=mlp_dim,
+            attention_dropout=attention_dropout,
+            projection_dropout=projection_dropout,
+            mlp_dropout=mlp_dropout,
+        )
+
+        # 常见 ViT 初始化。第一版使用全零初始化也能运行，
+        # 但截断正态分布更接近常见实现。
+        nn.init.trunc_normal_(self.cls_token, std=0.02)
+        nn.init.trunc_normal_(self.pos_embedding, std=0.02)
+
+    def forward(self, images: torch.Tensor) -> torch.Tensor:
+        # images: (B, C, H, W)
+        x = self.patch_embedding(images)
+        # x: (B, N, D)
+
+        batch_size = x.shape[0]
+
+        cls_tokens = self.cls_token.expand(batch_size, -1, -1)
+        # (1, 1, D) -> (B, 1, D)
+
+        x = torch.cat((cls_tokens, x), dim=1)
+        # (B, 1, D) 与 (B, N, D) 沿 token 维拼接
+        # x: (B, N+1, D)
+
+        if x.shape[1] != self.pos_embedding.shape[1]:
+            raise ValueError(
+                "Input token count does not match position embedding"
+            )
+
+        x = x + self.pos_embedding
+        # (B, N+1, D) + (1, N+1, D)
+        # 位置编码在 batch 维广播，结果仍为 (B, N+1, D)
+
+        x = self.embedding_dropout(x)
+        x = self.encoder(x)
+        # Encoder 不改变形状：仍为 (B, N+1, D)
+
+        return x
+```
+
+这个版本返回的是**全部 token**，不是分类结果：
+
+```text
+Transformer 输出：(B, N+1, D)
+```
+
+以 CIFAR-10 配置为例：
+
+```text
+images.shape = (2, 3, 32, 32)
+patch_size = 4
+embed_dim = 64
+
+每边 patch 数 = 32/4 = 8
+N = 8×8 = 64
+加入一个 CLS token 后，L = N+1 = 65
+
+最终全部 token：tokens.shape = (2, 65, 64)
+```
+
+#### 输出中的每一部分是什么
+
+```python
+tokens = model(images)       # (B, N+1, D)
+
+cls_features = tokens[:, 0]  # (B, D)
+patch_features = tokens[:, 1:]  # (B, N, D)
+```
+
+token 维的下标含义是：
+
+```text
+tokens[:, 0]    ：经过所有 Encoder 层处理后的 CLS token
+tokens[:, 1]    ：第 1 个 patch token
+tokens[:, 2]    ：第 2 个 patch token
+...
+tokens[:, N]    ：第 N 个 patch token
+```
+
+注意下面两个切片的形状不同：
+
+```python
+tokens[:, 0].shape      # (B, D)，token 维被索引掉
+tokens[:, 0:1].shape    # (B, 1, D)，保留 token 维
+```
+
+做图像分类时，分类头 `nn.Linear` 通常需要二维输入，所以使用：
+
+```python
+cls_features = tokens[:, 0]   # (B, D)
+logits = self.head(cls_features)
+# logits: (B, num_classes)
+```
+
+对于 CIFAR-10：
+
+```text
+全部 token：  (B, 65, D)
+取 CLS 后：   (B, D)
+分类头输出：  (B, 10)
+```
+
+因此，“最终输出形状”取决于所说的是哪一层：
+
+| 输出位置 | 形状 | 含义 |
+|---|---:|---|
+| PatchEmbedding 后 | `(B, N, D)` | 只有图像 patch token |
+| 加 CLS 和位置编码后 | `(B, N+1, D)` | 完整输入 token 序列 |
+| Encoder 后 | `(B, N+1, D)` | 全部 token 的编码结果 |
+| `tokens[:, 0]` 后 | `(B, D)` | 每张图片的 CLS 特征 |
+| 分类头后 | `(B, num_classes)` | 每张图片对各类别的 logits |
+
+`CrossEntropyLoss` 需要送入分类 logits，而不是全部 token：
+
+```python
+criterion = nn.CrossEntropyLoss()
+loss = criterion(logits, labels)
+
+# logits: (B, num_classes)
+# labels: (B,)，每个元素是类别编号
+```
+
+#### 为什么 Encoder 要保留全部 token
+
+虽然最终分类只取 CLS token，但不能在进入 Encoder 前就扔掉 patch token。每层自注意力都会让 CLS token 查询并汇总所有 patch token 的信息：
+
+```text
+CLS ↔ patch 1
+CLS ↔ patch 2
+...
+CLS ↔ patch N
+```
+
+经过多层交互后，最后的 `tokens[:, 0]` 才成为整张图片的特征表示。只有完成全部 Encoder 层之后，才取出 CLS token 用于分类。
+
+#### Transformer 的基础 pytest 测试
+
+```python
+import torch
+
+from src.transformer import VisionTransformer
+
+
+def test_transformer_output_shape():
+    model = VisionTransformer(
+        image_size=32,
+        patch_size=4,
+        in_channels=3,
+        num_layers=4,
+        embed_dim=64,
+        num_heads=8,
+        mlp_dim=256,
+    )
+
+    images = torch.randn(2, 3, 32, 32)
+    tokens = model(images)
+
+    assert tokens.shape == (2, 65, 64)
+    assert tokens[:, 0].shape == (2, 64)
+    assert tokens[:, 0:1].shape == (2, 1, 64)
+    assert tokens[:, 1:].shape == (2, 64, 64)
+```
+
+测试时可以额外验证不同 batch size。batch size 改变时，只有第 0 维改变：
+
+```python
+def test_transformer_different_batch_size():
+    model = VisionTransformer(
+        image_size=32,
+        patch_size=4,
+        in_channels=3,
+        num_layers=2,
+        embed_dim=64,
+        num_heads=8,
+        mlp_dim=128,
+    )
+
+    images = torch.randn(7, 3, 32, 32)
+    tokens = model(images)
+
+    assert tokens.shape == (7, 65, 64)
+```
+
+如果决定让 `VisionTransformer` 直接代表完整分类模型，也可以在构造函数中增加：
+
+```python
+self.head = nn.Linear(embed_dim, num_classes)
+```
+
+并把 `forward` 的最后两行改为：
+
+```python
+cls_features = x[:, 0]
+logits = self.head(cls_features)
+return logits
+```
+
+此时模型对外输出的是 `(B, num_classes)`，而不是 `(B, N+1, D)`。两种设计都能工作，但测试和训练代码必须与所选接口保持一致。本项目在当前阶段建议先返回全部 token，确认 token 流程无误；下一步加入分类头时再返回 logits。
+
 ## 11. 完整 ViT 数据流
 
 ```text
