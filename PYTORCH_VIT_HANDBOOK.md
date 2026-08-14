@@ -578,6 +578,223 @@ class EncoderBlock(nn.Module):
         return x
 ```
 
+### 10.1 用多个 Encoder Block 组成完整 Encoder
+
+一个 Encoder Block 只完成一次 Attention 和 MLP 处理。完整 ViT Encoder 要把结构相同、但参数彼此独立的 Block 串联起来：
+
+```text
+x
+→ Block 0
+→ Block 1
+→ ...
+→ Block depth-1
+→ 最终 LayerNorm
+→ Encoder 输出
+```
+
+与本项目当前的 `Encoder1Block` 接口对应，可以写成：
+
+```python
+import torch
+from torch import nn
+
+from src.encoder import Encoder1Block
+
+
+class Encoder(nn.Module):
+    def __init__(
+        self,
+        depth: int,
+        embed_dim: int,
+        num_heads: int,
+        mlp_dim: int,
+        attention_dropout: float = 0.0,
+        projection_dropout: float = 0.0,
+        mlp_dropout: float = 0.0,
+    ):
+        super().__init__()
+
+        if depth <= 0:
+            raise ValueError("depth must be a positive integer")
+
+        self.blocks = nn.ModuleList([
+            Encoder1Block(
+                embed_dim=embed_dim,
+                num_heads=num_heads,
+                mlp_dim=mlp_dim,
+                attention_dropout=attention_dropout,
+                projection_dropout=projection_dropout,
+                mlp_dropout=mlp_dropout,
+            )
+            for _ in range(depth)
+        ])
+
+        # Pre-Norm Transformer 堆叠完成后通常再做一次最终归一化。
+        self.norm = nn.LayerNorm(embed_dim)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        # x 始终保持 (B, N, D)
+        for block in self.blocks:
+            x = block(x)
+
+        x = self.norm(x)
+        return x
+```
+
+`range(depth)` 依次产生：
+
+```python
+0, 1, 2, ..., depth - 1
+```
+
+这里不需要使用这些编号，所以按 Python 惯例将循环变量写成 `_`：
+
+```python
+for _ in range(depth)
+```
+
+列表推导式的含义可以展开成普通循环：
+
+```python
+blocks = []
+
+for _ in range(depth):
+    block = Encoder1Block(...)
+    blocks.append(block)
+
+self.blocks = nn.ModuleList(blocks)
+```
+
+关键点是 `Encoder1Block(...)` 位于循环内部。每轮循环都会调用一次构造函数，创建一个新的 Python 对象以及一套新的 `LayerNorm`、Attention、MLP 参数。因此，虽然所有 Block 的结构和超参数相同，但可训练参数彼此独立。
+
+如果 `depth=3`，PyTorch 会把参数注册成类似下面的层次：
+
+```text
+blocks.0.norm1.weight
+blocks.0.attention.qkv.weight
+blocks.0.mlp.fc1.weight
+
+blocks.1.norm1.weight
+blocks.1.attention.qkv.weight
+blocks.1.mlp.fc1.weight
+
+blocks.2.norm1.weight
+blocks.2.attention.qkv.weight
+blocks.2.mlp.fc1.weight
+
+norm.weight
+norm.bias
+```
+
+这些不同的名字会出现在 `model.named_parameters()` 和 `model.state_dict()` 中，优化器也能找到并分别更新它们。
+
+#### 会意外共享参数的错误写法
+
+下面的代码只创建了一个 Block，然后把同一个对象引用放入列表多次：
+
+```python
+shared_block = Encoder1Block(...)
+self.blocks = nn.ModuleList([shared_block] * depth)  # 错误：共享参数
+```
+
+下面这种写法也一样会共享：
+
+```python
+shared_block = Encoder1Block(...)
+self.blocks = nn.ModuleList([
+    shared_block
+    for _ in range(depth)
+])  # 错误：仍然是同一个对象
+```
+
+它们在前向传播时确实会执行 `depth` 次，但每次使用的都是同一套权重。这属于循环使用同一个模型，而不是堆叠多个独立层。
+
+正确写法是在每次循环中重新执行构造函数：
+
+```python
+self.blocks = nn.ModuleList([
+    Encoder1Block(...)
+    for _ in range(depth)
+])
+```
+
+`nn.ModuleList` 本身不负责前向传播，它主要负责向 PyTorch 注册其中的所有子模块。因此仍然要在 `forward` 中显式循环：
+
+```python
+for block in self.blocks:
+    x = block(x)
+```
+
+每轮的输出都会赋值回 `x`，再作为下一层的输入。若有三个 Block，则等价于：
+
+```python
+x = self.blocks[0](x)
+x = self.blocks[1](x)
+x = self.blocks[2](x)
+```
+
+也可以使用 `nn.Sequential` 自动依次调用各层，但 `ModuleList + for` 更直观，也方便以后加入返回中间特征、梯度检查点或逐层调试等逻辑。
+
+#### Encoder 的基础 pytest 测试
+
+```python
+import torch
+
+from src.encoder import Encoder
+
+
+def test_encoder_output_shape():
+    model = Encoder(
+        depth=4,
+        embed_dim=64,
+        num_heads=8,
+        mlp_dim=256,
+    )
+
+    x = torch.randn(2, 65, 64)
+    output = model(x)
+
+    assert output.shape == (2, 65, 64)
+    assert len(model.blocks) == 4
+
+
+def test_encoder_blocks_do_not_share_parameters():
+    model = Encoder(
+        depth=2,
+        embed_dim=64,
+        num_heads=8,
+        mlp_dim=256,
+    )
+
+    # 两个列表元素必须是不同的 Encoder1Block 对象。
+    assert model.blocks[0] is not model.blocks[1]
+
+    weight0 = model.blocks[0].attention.qkv.weight
+    weight1 = model.blocks[1].attention.qkv.weight
+
+    # 两个 Parameter 对象不同，底层存储地址也不同。
+    assert weight0 is not weight1
+    assert weight0.data_ptr() != weight1.data_ptr()
+```
+
+这里不要通过下面的方式判断是否共享：
+
+```python
+assert not torch.equal(weight0, weight1)
+```
+
+“数值是否相等”和“是否为同一个参数”是两件事。判断参数共享应检查对象身份或存储地址，即 `is` 和 `data_ptr()`。
+
+完整 Encoder 不改变张量形状：
+
+```text
+输入： (B, N, D)
+每层： (B, N, D) → (B, N, D)
+输出： (B, N, D)
+```
+
+Block 的输出形状相同，是因为残差连接要求相加的两个张量形状完全一致；不同层通过各自独立的权重对特征进行逐层变换。
+
 形状主线：
 
 ```text
