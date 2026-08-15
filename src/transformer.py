@@ -10,7 +10,9 @@ class VisionTransformer(nn.Module):
                  num_layers: int, embed_dim: int, 
                  num_heads: int, mlp_dim: int,
                  embed_dropout: float = 0.0, attention_dropout: float = 0.0, projection_dropout: float = 0.0,
-                 mlp_dropout: float = 0.0):
+                 mlp_dropout: float = 0.0,
+                 classifier: str = "token",
+                 num_classes: int = 10):
         super().__init__()
         self.patch_embedding = PatchEmbedding(
             image_size=image_size,
@@ -36,6 +38,19 @@ class VisionTransformer(nn.Module):
         nn.init.trunc_normal_(self.cls_token, std=0.02)
         nn.init.trunc_normal_(self.pos_embedding, std=0.02)
 
+        # Keep the output mode and the trainable classification layer separate.
+        # Otherwise assigning nn.Linear to self.classifier would overwrite the
+        # string used by forward() to choose the output branch.
+        if classifier not in ["token", "cls"]:
+            raise ValueError(f"Invalid classifier type: {classifier}. Must be 'token' or 'cls'.")
+
+        self.classifier = classifier
+        self.head = (
+            nn.Linear(embed_dim, num_classes)
+            if classifier == "cls"
+            else None
+        )
+
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         # image: (B,C,H,W)
         x = self.patch_embedding(x) #(B,N,D)
@@ -50,4 +65,9 @@ class VisionTransformer(nn.Module):
 
         x = self.encoder(x) #(B,N+1,D)
 
+        if self.classifier == "token":
+            return x  # (B,N+1,D)
+
+        x = x[:, 0]  # (B,D), take the class token
+        x = self.head(x)  # (B,num_classes)
         return x

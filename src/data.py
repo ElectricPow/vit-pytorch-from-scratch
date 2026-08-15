@@ -23,7 +23,7 @@ def make_transforms():
 
     return train_transform, eval_transform
 
-def bulid_cifar10_datasets(
+def build_cifar10_datasets(
         data_dir: str | Path = "data",
         val_ratio: float = 0.1,
         seed: int = 42
@@ -61,8 +61,8 @@ def bulid_cifar10_datasets(
     # Shuffle the indices
     indices = torch.randperm(num_examples, generator=generator).tolist()
 
-    train_indices = indices[:val_size]
-    val_indices = indices[val_size:]
+    train_indices = indices[val_size:]
+    val_indices = indices[:val_size]
 
     train_dataset = Subset(train_full, train_indices)
     val_dataset = Subset(val_full, val_indices)
@@ -78,7 +78,7 @@ def build_cifar10_dataloaders(
         val_ratio: float = 0.1,
         seed: int = 42
 ):
-    train_set, val_set, test_set = bulid_cifar10_datasets(data_dir, val_ratio, seed)
+    train_set, val_set, test_set = build_cifar10_datasets(data_dir, val_ratio, seed)
 
     # CUDA is available, pin_memory should be set to True to speed up data transfer to GPU
     pin_memory = torch.cuda.is_available()

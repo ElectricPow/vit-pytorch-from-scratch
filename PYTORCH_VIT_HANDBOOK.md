@@ -2319,16 +2319,19 @@ CLS token 分类
 
 ## 27. 当前下一步
 
-模型主体已经基本完成，当前进入 CIFAR-10 数据管道阶段：
+模型结构和 CIFAR-10 数据读取已经基本完成，下一阶段按以下顺序推进：
 
-1. 在 `requirements.txt` 中记录 `torch`、`torchvision`、`pytest`；
-2. 新建 `src/data.py`，实现 `make_transforms()`；
-3. 实现可复现的 train/val/test Dataset 划分；
-4. 实现 `build_cifar10_loaders()`；
-5. 用 `num_workers=0` 下载并检查第一个 batch；
-6. 确认 `images` 为 `(B,3,32,32)`，`labels` 为 `(B,)`；
-7. 将一个 batch 送入完整分类模型，确认 logits 为 `(B,10)`；
-8. 数据管道通过后，开始实现单步训练与少量样本过拟合测试。
+1. 修正并验证 train/val 数据划分；
+2. 编写“单个训练 step”测试，证明参数确实更新；
+3. 编写 `src/engine.py`，封装一个 epoch 的训练和验证；
+4. 用 16～32 个样本做过拟合实验；
+5. 编写 `configs/cifar10.py`，集中保存配置；
+6. 完善 `utils.py`，加入随机种子、参数统计和 checkpoint；
+7. 完成 `train.py`，串联模型、数据、优化器、训练和验证；
+8. 完成 `evaluate.py`，加载最佳 checkpoint 并只在 test 集评估；
+9. 最后再考虑 warmup、混合精度、TensorBoard 等增强功能。
+
+不要跳过单步更新和小数据过拟合，直接开始几十或几百个 epoch 的正式训练。前两项是发现实现错误成本最低的阶段。
 
 推荐按下面的提交边界保存版本：
 
@@ -2338,3 +2341,688 @@ CLS token 分类
 提交 3：完成单步反向传播与少量样本过拟合
 提交 4：完成正式训练、验证、日志和 checkpoint
 ```
+
+## 28. 后续文件及其职责
+
+推荐把后续代码组织为：
+
+```text
+vit-pytorch-from-scratch/
+├── configs/
+│   └── cifar10.py              # 模型、数据和训练超参数
+├── src/
+│   ├── data.py                 # 已完成：Dataset 与 DataLoader
+│   ├── engine.py               # train_one_epoch、evaluate_one_epoch
+│   └── ...                     # 已完成的模型模块
+├── tests/
+│   ├── test_train_step.py      # 梯度、参数更新、loss 有限
+│   └── ...                     # 已完成的形状测试
+├── train.py                    # 正式训练入口
+├── evaluate.py                 # 最终测试入口
+├── utils.py                    # seed、参数量、checkpoint
+└── requirements.txt
+```
+
+调用链：
+
+```text
+python train.py
+→ 读取 Config
+→ seed_everything
+→ build_cifar10_dataloaders
+→ 创建 VisionTransformer(classifier="cls")
+→ 创建 loss、optimizer、scheduler
+→ 循环 epoch
+   ├── train_one_epoch
+   ├── evaluate_one_epoch(val)
+   ├── scheduler.step
+   ├── 保存 last checkpoint
+   └── 若 val accuracy 更高，保存 best checkpoint
+
+python evaluate.py
+→ 用相同 Config 创建模型
+→ 加载 best checkpoint
+→ evaluate_one_epoch(test)
+→ 输出最终 test loss/accuracy
+```
+
+### 28.1 进入训练前先修正当前数据划分
+
+若验证集比例为 `0.1`，应有 45,000 个训练样本、5,000 个验证样本。索引应写为：
+
+```python
+val_indices = indices[:val_size]
+train_indices = indices[val_size:]
+```
+
+不要写反：
+
+```python
+train_indices = indices[:val_size]   # 这只得到 5,000 个
+val_indices = indices[val_size:]     # 这会得到 45,000 个
+```
+
+加入测试：
+
+```python
+assert len(train_set) == 45_000
+assert len(val_set) == 5_000
+assert set(train_set.indices).isdisjoint(val_set.indices)
+```
+
+## 29. 配置文件 `configs/cifar10.py`
+
+配置的作用是避免数字散落在多个文件中。第一版可使用标准库 `dataclass`：
+
+```python
+from dataclasses import dataclass
+
+
+@dataclass(frozen=True)
+class Config:
+    # 可复现性与数据
+    seed: int = 42
+    data_dir: str = "data"
+    batch_size: int = 128
+    eval_batch_size: int = 256
+    num_workers: int = 0
+    val_ratio: float = 0.1
+
+    # 模型
+    image_size: int = 32
+    patch_size: int = 4
+    in_channels: int = 3
+    num_classes: int = 10
+    num_layers: int = 6
+    embed_dim: int = 192
+    num_heads: int = 3
+    mlp_dim: int = 768
+    embed_dropout: float = 0.1
+    attention_dropout: float = 0.0
+    projection_dropout: float = 0.1
+    mlp_dropout: float = 0.1
+
+    # 训练
+    num_epochs: int = 100
+    learning_rate: float = 3e-4
+    weight_decay: float = 0.05
+    grad_clip: float = 1.0
+    label_smoothing: float = 0.0
+    min_learning_rate: float = 1e-6
+
+    # 输出
+    checkpoint_dir: str = "checkpoints"
+
+
+def get_config() -> Config:
+    return Config()
+```
+
+使用：
+
+```python
+from configs.cifar10 import get_config
+
+config = get_config()
+print(config.embed_dim)
+print(config.learning_rate)
+```
+
+`frozen=True` 表示创建后不应随意修改字段，有助于避免训练中途误改配置。它不是必须的；如果需要在命令行覆盖配置，可以先移除它。
+
+配置值只是合理起点，不保证是 CIFAR-10 上的最佳超参数。第一轮目标仍然是验证代码正确，而不是追求最高准确率。
+
+## 30. 单步训练测试 `tests/test_train_step.py`
+
+它回答四个问题：
+
+1. 模型是否输出 `(B,10)`；
+2. loss 是否为有限标量；
+3. 分类头是否获得梯度；
+4. `optimizer.step()` 后参数是否改变。
+
+```python
+import torch
+import torch.nn.functional as F
+
+from src.transformer import VisionTransformer
+
+
+def test_one_train_step_updates_parameters():
+    torch.manual_seed(42)
+
+    # 测试使用小模型，避免单元测试太慢。
+    model = VisionTransformer(
+        image_size=32,
+        patch_size=4,
+        in_channels=3,
+        num_layers=2,
+        embed_dim=64,
+        num_heads=4,
+        mlp_dim=128,
+        classifier="cls",
+        num_classes=10,
+    )
+    model.train()
+
+    optimizer = torch.optim.AdamW(
+        model.parameters(),
+        lr=1e-3,
+        weight_decay=0.0,
+    )
+
+    images = torch.randn(4, 3, 32, 32)
+    labels = torch.tensor([0, 1, 2, 3], dtype=torch.long)
+
+    old_weight = model.head.weight.detach().clone()
+
+    optimizer.zero_grad(set_to_none=True)
+    logits = model(images)
+    loss = F.cross_entropy(logits, labels)
+    loss.backward()
+
+    assert logits.shape == (4, 10)
+    assert loss.ndim == 0
+    assert torch.isfinite(loss)
+    assert model.head.weight.grad is not None
+    assert torch.isfinite(model.head.weight.grad).all()
+
+    optimizer.step()
+
+    new_weight = model.head.weight.detach()
+    assert not torch.equal(old_weight, new_weight)
+```
+
+这里使用 `classifier="cls"` 非常重要。若模型返回 `(B,65,D)` tokens，就不能直接与 `(B,)` 标签计算普通图像分类交叉熵。
+
+运行：
+
+```powershell
+python -m pytest tests/test_train_step.py -v
+```
+
+## 31. 训练和验证引擎 `src/engine.py`
+
+### 31.1 为什么单独建立 engine
+
+`train.py` 负责“统筹实验”，`engine.py` 负责“怎样训练或验证一个 epoch”。这样 `evaluate.py` 可以直接复用验证函数，而不复制代码。
+
+### 31.2 训练一个 epoch
+
+```python
+import torch
+from torch import nn
+from torch.utils.data import DataLoader
+
+
+def train_one_epoch(
+    model: nn.Module,
+    loader: DataLoader,
+    criterion: nn.Module,
+    optimizer: torch.optim.Optimizer,
+    device: torch.device,
+    grad_clip: float | None = None,
+) -> dict[str, float]:
+    model.train()
+
+    loss_sum = 0.0
+    correct_sum = 0
+    sample_count = 0
+
+    for images, labels in loader:
+        images = images.to(device, non_blocking=True)
+        labels = labels.to(device, non_blocking=True)
+
+        optimizer.zero_grad(set_to_none=True)
+
+        logits = model(images)
+        loss = criterion(logits, labels)
+
+        if not torch.isfinite(loss):
+            raise RuntimeError(f"Non-finite loss: {loss.item()}")
+
+        loss.backward()
+
+        if grad_clip is not None:
+            torch.nn.utils.clip_grad_norm_(
+                model.parameters(),
+                max_norm=grad_clip,
+                error_if_nonfinite=True,
+            )
+
+        optimizer.step()
+
+        batch_size = labels.shape[0]
+        loss_sum += loss.item() * batch_size
+        correct_sum += (
+            logits.argmax(dim=1) == labels
+        ).sum().item()
+        sample_count += batch_size
+
+    return {
+        "loss": loss_sum / sample_count,
+        "accuracy": correct_sum / sample_count,
+    }
+```
+
+不要把每个 batch 的平均 loss 再简单平均，因为最后一个 batch 可能较小。这里把 batch mean loss 乘回 `batch_size`，最后再除以总样本数。
+
+### 31.3 验证一个 epoch
+
+```python
+@torch.inference_mode()
+def evaluate_one_epoch(
+    model: nn.Module,
+    loader: DataLoader,
+    criterion: nn.Module,
+    device: torch.device,
+) -> dict[str, float]:
+    model.eval()
+
+    loss_sum = 0.0
+    correct_sum = 0
+    sample_count = 0
+
+    for images, labels in loader:
+        images = images.to(device, non_blocking=True)
+        labels = labels.to(device, non_blocking=True)
+
+        logits = model(images)
+        loss = criterion(logits, labels)
+
+        batch_size = labels.shape[0]
+        loss_sum += loss.item() * batch_size
+        correct_sum += (
+            logits.argmax(dim=1) == labels
+        ).sum().item()
+        sample_count += batch_size
+
+    return {
+        "loss": loss_sum / sample_count,
+        "accuracy": correct_sum / sample_count,
+    }
+```
+
+验证阶段的三项关键区别：
+
+```text
+model.eval()             关闭 Dropout 等训练行为
+torch.inference_mode()   不构建梯度图
+没有 optimizer.step()    不更新任何参数
+```
+
+`inference_mode` 比 `no_grad` 限制更强，适合纯验证和推理；第一版使用二者之一都可以。
+
+## 32. 工具函数 `utils.py`
+
+### 32.1 随机种子
+
+```python
+import random
+from pathlib import Path
+
+import torch
+
+
+def seed_everything(seed: int) -> None:
+    random.seed(seed)
+    torch.manual_seed(seed)
+    torch.cuda.manual_seed_all(seed)
+```
+
+### 32.2 参数量统计
+
+```python
+def count_parameters(model: torch.nn.Module) -> int:
+    return sum(
+        parameter.numel()
+        for parameter in model.parameters()
+        if parameter.requires_grad
+    )
+```
+
+### 32.3 保存 checkpoint
+
+```python
+def save_checkpoint(
+    path: str | Path,
+    epoch: int,
+    model: torch.nn.Module,
+    optimizer: torch.optim.Optimizer,
+    scheduler,
+    best_val_accuracy: float,
+) -> None:
+    path = Path(path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+
+    torch.save(
+        {
+            "epoch": epoch,
+            "model": model.state_dict(),
+            "optimizer": optimizer.state_dict(),
+            "scheduler": (
+                scheduler.state_dict()
+                if scheduler is not None
+                else None
+            ),
+            "best_val_accuracy": best_val_accuracy,
+        },
+        path,
+    )
+```
+
+### 32.4 恢复 checkpoint
+
+```python
+def load_checkpoint(
+    path: str | Path,
+    model: torch.nn.Module,
+    device: torch.device,
+    optimizer: torch.optim.Optimizer | None = None,
+    scheduler=None,
+) -> tuple[int, float]:
+    checkpoint = torch.load(
+        path,
+        map_location=device,
+        weights_only=True,
+    )
+
+    model.load_state_dict(checkpoint["model"])
+
+    if optimizer is not None:
+        optimizer.load_state_dict(checkpoint["optimizer"])
+
+    if scheduler is not None and checkpoint["scheduler"] is not None:
+        scheduler.load_state_dict(checkpoint["scheduler"])
+
+    start_epoch = checkpoint["epoch"] + 1
+    best_val_accuracy = checkpoint["best_val_accuracy"]
+    return start_epoch, best_val_accuracy
+```
+
+只加载可信来源的 checkpoint。`map_location=device` 用于把张量映射到当前设备；`weights_only=True` 限制可反序列化的对象类型。当前保存的字典只包含张量、基本类型和各类 `state_dict`，适合这种方式。
+
+两种 checkpoint 的职责：
+
+```text
+last.pt：每个 epoch 覆盖，程序中断后继续训练
+best.pt：仅当 val accuracy 提升时覆盖，最终测试使用
+```
+
+## 33. 完整训练入口 `train.py`
+
+下面的代码展示各模块怎样串起来。实现时可以先不加 resume 和复杂日志。
+
+```python
+from pathlib import Path
+
+import torch
+from torch import nn
+
+from configs.cifar10 import get_config
+from src.data import build_cifar10_dataloaders
+from src.engine import evaluate_one_epoch, train_one_epoch
+from src.transformer import VisionTransformer
+from utils import count_parameters, save_checkpoint, seed_everything
+
+
+def create_model(config) -> VisionTransformer:
+    return VisionTransformer(
+        image_size=config.image_size,
+        patch_size=config.patch_size,
+        in_channels=config.in_channels,
+        num_layers=config.num_layers,
+        embed_dim=config.embed_dim,
+        num_heads=config.num_heads,
+        mlp_dim=config.mlp_dim,
+        embed_dropout=config.embed_dropout,
+        attention_dropout=config.attention_dropout,
+        projection_dropout=config.projection_dropout,
+        mlp_dropout=config.mlp_dropout,
+        classifier="cls",
+        num_classes=config.num_classes,
+    )
+
+
+def main() -> None:
+    config = get_config()
+    seed_everything(config.seed)
+
+    device = torch.device(
+        "cuda" if torch.cuda.is_available() else "cpu"
+    )
+
+    train_loader, val_loader, _ = build_cifar10_dataloaders(
+        data_dir=config.data_dir,
+        batch_size=config.batch_size,
+        eval_batch_size=config.eval_batch_size,
+        num_workers=config.num_workers,
+        val_ratio=config.val_ratio,
+        seed=config.seed,
+    )
+
+    model = create_model(config).to(device)
+
+    criterion = nn.CrossEntropyLoss(
+        label_smoothing=config.label_smoothing,
+    )
+
+    optimizer = torch.optim.AdamW(
+        model.parameters(),
+        lr=config.learning_rate,
+        weight_decay=config.weight_decay,
+    )
+
+    scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
+        optimizer,
+        T_max=config.num_epochs,
+        eta_min=config.min_learning_rate,
+    )
+
+    checkpoint_dir = Path(config.checkpoint_dir)
+    best_val_accuracy = 0.0
+
+    print(f"device: {device}")
+    print(f"trainable parameters: {count_parameters(model):,}")
+
+    for epoch in range(config.num_epochs):
+        current_lr = optimizer.param_groups[0]["lr"]
+
+        train_metrics = train_one_epoch(
+            model=model,
+            loader=train_loader,
+            criterion=criterion,
+            optimizer=optimizer,
+            device=device,
+            grad_clip=config.grad_clip,
+        )
+
+        val_metrics = evaluate_one_epoch(
+            model=model,
+            loader=val_loader,
+            criterion=criterion,
+            device=device,
+        )
+
+        scheduler.step()
+
+        print(
+            f"epoch {epoch + 1:03d}/{config.num_epochs:03d} "
+            f"lr={current_lr:.6g} "
+            f"train_loss={train_metrics['loss']:.4f} "
+            f"train_acc={train_metrics['accuracy']:.4f} "
+            f"val_loss={val_metrics['loss']:.4f} "
+            f"val_acc={val_metrics['accuracy']:.4f}"
+        )
+
+        is_best = val_metrics["accuracy"] > best_val_accuracy
+        if is_best:
+            best_val_accuracy = val_metrics["accuracy"]
+
+        save_checkpoint(
+            path=checkpoint_dir / "last.pt",
+            epoch=epoch,
+            model=model,
+            optimizer=optimizer,
+            scheduler=scheduler,
+            best_val_accuracy=best_val_accuracy,
+        )
+
+        if is_best:
+            save_checkpoint(
+                path=checkpoint_dir / "best.pt",
+                epoch=epoch,
+                model=model,
+                optimizer=optimizer,
+                scheduler=scheduler,
+                best_val_accuracy=best_val_accuracy,
+            )
+
+
+if __name__ == "__main__":
+    main()
+```
+
+运行：
+
+```powershell
+python train.py
+```
+
+`CrossEntropyLoss` 接收未经 softmax 的 logits；不要在模型分类头后手动调用 softmax。其典型形状是：
+
+```text
+logits: (B,10)，float
+labels: (B,)，long，类别编号 0～9
+loss:   ()，标量
+```
+
+当前示例按 epoch 调用一次 `scheduler.step()`，因此 `T_max=config.num_epochs`。如果以后改成每个 batch 调用 scheduler，就必须相应地用总 step 数配置调度周期，不能混用。
+
+## 34. 最终测试入口 `evaluate.py`
+
+测试集只在模型和超参数确定后使用：
+
+```python
+import torch
+from torch import nn
+
+from configs.cifar10 import get_config
+from src.data import build_cifar10_dataloaders
+from src.engine import evaluate_one_epoch
+from train import create_model
+
+
+def main() -> None:
+    config = get_config()
+    device = torch.device(
+        "cuda" if torch.cuda.is_available() else "cpu"
+    )
+
+    _, _, test_loader = build_cifar10_dataloaders(
+        data_dir=config.data_dir,
+        batch_size=config.batch_size,
+        eval_batch_size=config.eval_batch_size,
+        num_workers=config.num_workers,
+        val_ratio=config.val_ratio,
+        seed=config.seed,
+    )
+
+    model = create_model(config).to(device)
+    checkpoint = torch.load(
+        "checkpoints/best.pt",
+        map_location=device,
+        weights_only=True,
+    )
+    model.load_state_dict(checkpoint["model"])
+
+    criterion = nn.CrossEntropyLoss()
+    metrics = evaluate_one_epoch(
+        model=model,
+        loader=test_loader,
+        criterion=criterion,
+        device=device,
+    )
+
+    print(f"test_loss={metrics['loss']:.4f}")
+    print(f"test_accuracy={metrics['accuracy']:.4f}")
+
+
+if __name__ == "__main__":
+    main()
+```
+
+注意：如果训练时使用了非零 `label_smoothing`，验证 loss 是否也使用相同设置要提前统一约定。准确率计算不受这个选项影响。第一版可以全部设为 `0.0`。
+
+## 35. 正式训练前的小数据过拟合
+
+### 35.1 为什么要做
+
+小数据过拟合不是为了获得泛化能力，而是验证整条链路是否具备学习能力。如果 16～32 张固定图片都无法记住，长时间训练通常只会浪费算力。
+
+### 35.2 建议设置
+
+```text
+样本数：16～32
+数据增强：关闭随机裁剪和随机翻转
+Dropout：全部设为 0
+weight_decay：0
+模型：可缩小到 depth=2、D=64、heads=4、mlp_dim=128
+目标：训练准确率逐渐接近 100%，loss 明显下降
+```
+
+固定小数据集：
+
+```python
+from torch.utils.data import DataLoader, Subset
+from torchvision import datasets
+
+from src.data import make_transforms
+
+
+_, eval_transform = make_transforms()
+
+dataset = datasets.CIFAR10(
+    root="data",
+    train=True,
+    download=True,
+    transform=eval_transform,
+)
+
+small_set = Subset(dataset, list(range(32)))
+small_loader = DataLoader(
+    small_set,
+    batch_size=32,
+    shuffle=True,
+    num_workers=0,
+)
+```
+
+反复对同一个 `small_loader` 调用 `train_one_epoch`。若失败，按顺序检查：
+
+1. 模型是否为 `classifier="cls"`；
+2. logits 和 labels 形状是否为 `(B,10)`、`(B,)`；
+3. 是否调用 `model.train()`；
+4. 是否执行 `zero_grad → forward → loss → backward → step`；
+5. 关键参数的 `.grad` 是否为 `None` 或非有限值；
+6. 学习率是否过小或过大；
+7. 数据和标签是否对应；
+8. 是否错误地在训练函数上使用了 `no_grad`/`inference_mode`。
+
+## 36. 第一版训练完成标准
+
+依次确认：
+
+- 数据划分是 train=45,000、val=5,000、test=10,000；
+- 所有已有 pytest 通过；
+- 单个训练 step 能产生有限 loss 和梯度，并改变参数；
+- 16～32 个固定样本可以明显过拟合；
+- `train_one_epoch` 和 `evaluate_one_epoch` 正确处理最后的小 batch；
+- 日志同时显示 epoch、lr、train loss/accuracy、val loss/accuracy；
+- `last.pt` 可以恢复训练状态；
+- `best.pt` 对应最高 val accuracy；
+- 正式训练期间不使用 test 指标选择模型；
+- `evaluate.py` 能加载 `best.pt` 并输出最终 test 指标；
+- checkpoint、data 和日志目录没有被 Git 提交。
+
+完成这些内容后，第一版“从零实现并训练 ViT”才形成闭环。之后再逐项加入 warmup、自动混合精度、TensorBoard、命令行参数和更强数据增强，每次只加一个功能并重新验证。
