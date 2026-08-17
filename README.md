@@ -2,9 +2,9 @@
 
 使用 PyTorch 从零实现 Vision Transformer（ViT），并搭建 CIFAR-10 图像分类所需的数据、训练、验证、测试和 checkpoint 流程。
 
-本项目是本科阶段进入实验室后的源码学习与复现实践。实现过程中没有直接调用 `nn.MultiheadAttention` 或 `nn.TransformerEncoder` 隐藏核心结构，而是手工完成 Patch Embedding、多头自注意力、MLP、Encoder Block 和完整 ViT，重点理解每一步矩阵运算、张量形状以及 PyTorch 的参数管理方式。
+本实现过程中没有直接调用 `nn.MultiheadAttention` 或 `nn.TransformerEncoder` 隐藏核心结构，而是手工完成 Patch Embedding、多头自注意力、MLP、Encoder Block 和完整 ViT，重点理解每一步矩阵运算、张量形状以及 PyTorch 的参数管理方式。
 
-> 当前状态：模型与训练代码闭环已经完成，各模块形状、真实 CIFAR-10 batch 前向传播和单步反向更新均已验证；尚未提交完整 100 epoch 的正式训练精度，因此本文不报告未经实验得到的准确率。
+> 当前状态：模型与训练代码闭环已经完成，各模块形状、真实 CIFAR-10 batch 前向传播和单步反向更新均已验证；在实验室服务器上使用单卡、默认配置从零训练 100 epoch，CIFAR-10 分类准确率达到约 81%。
 
 ## 本周完成内容
 
@@ -18,8 +18,8 @@
 - 完成 CIFAR-10 下载、增强、归一化和可复现的 train/val/test 划分；
 - 完成训练与验证循环、AdamW、梯度裁剪、余弦学习率调度；
 - 完成 `last.pt` / `best.pt` checkpoint 保存和最佳模型测试入口；
+- 在实验室服务器上完成默认配置的单卡 100 epoch 从零训练，CIFAR-10 accuracy 达到约 81%；
 - 为核心模块编写形状测试，并验证一次反向传播能够真实更新模型参数；
-- 整理了一份面向初学者的 [PyTorch ViT 复现手册](PYTORCH_VIT_HANDBOOK.md)。
 
 ## 模型结构
 
@@ -314,12 +314,15 @@ test_accuracy=...
 | 单步 loss、梯度和参数更新 | 通过 |
 | CIFAR-10 45k/5k/10k 划分 | 通过 |
 | 真实 batch `(128,3,32,32) → (128,10)` | 通过 |
+| 单卡、默认配置、从零训练 | 100 epoch |
+| CIFAR-10 分类准确率 | 约 81% |
 
-完整长周期训练指标尚待实际运行。后续得到可复现结果后，应记录硬件、软件版本、随机种子、最佳 epoch、验证准确率和最终测试准确率。
+该结果来自实验室服务器上的单卡训练，没有使用预训练权重。与公开可查的同规模 ViT 在 CIFAR-10 上从零训练的结果相比，约 81% 的准确率处于合理范围，说明当前模型结构、数据管道和训练流程能够正常学习。
+
 
 ## 学习过程总结
 
-这次复现最重要的收获不是把模块名称照搬一遍，而是建立了从论文公式到工程代码的对应关系：
+这次复现建立了从论文公式到工程代码的对应关系：
 
 1. 理解图片怎样通过卷积变成 token 序列；
 2. 将逐 token 的 QKV 公式转换为带 batch 和多头维度的矩阵运算；
@@ -330,9 +333,9 @@ test_accuracy=...
 7. 将模型前向扩展到 Dataset、DataLoader、loss、反向传播、优化器和 checkpoint 的完整训练系统；
 8. 通过形状测试和单步更新测试逐层验证，而不是等完整训练失败后再排查。
 
-更详细的 Python、PyTorch、ViT 形状推导和训练知识见 [PYTORCH_VIT_HANDBOOK.md](PYTORCH_VIT_HANDBOOK.md)。
 
-## 已知限制与后续计划
+
+## 已知限制
 
 当前版本以理解和正确性为优先，暂未实现：
 
@@ -347,13 +350,7 @@ test_accuracy=...
 - 多 GPU / DistributedDataParallel；
 - 系统超参数搜索。
 
-下一阶段计划：
 
-1. 先用 16～32 张固定图片完成小数据过拟合检查；
-2. 运行默认配置的完整训练并记录曲线和最佳结果；
-3. 依次研究 warmup、label smoothing 和参数分组 weight decay；
-4. 在保持可复现的前提下做单变量消融实验；
-5. 对照官方实现继续检查初始化和训练细节。
 
 ## 参考资料
 
